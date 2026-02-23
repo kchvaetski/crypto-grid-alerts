@@ -1,11 +1,10 @@
 name: Crypto Grid Alerts
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch: 
   schedule:
-    # 8 раз в сутки = каждые 3 часа
-    - cron: "0 */3 * * *"
-
+    - cron: "*/30 * * * *"
+    
 jobs:
   run-bot:
     runs-on: ubuntu-latest
