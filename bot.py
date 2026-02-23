@@ -284,7 +284,7 @@ def main():
 
 # SAFE: do NOT send Telegram message (only log)
 safe_line = (
-    f"SAFE ({now_utc}) "
+    f"SAFE  "
     f"BTC ${btc_price:,.2f} | SOL ${sol_price:,.4f} | DOGE ${doge_price:,.6f} | "
     f"BTC RSI Daily {('n/a' if daily_rsi is None else f'{daily_rsi:.1f}')} / Weekly {('n/a' if weekly_rsi is None else f'{weekly_rsi:.1f}')}"
 )
