@@ -44,7 +44,7 @@ def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 30, re
     GET JSON with simple retry/backoff for transient errors (429/5xx/network).
     """
     last_err = None
-    headers = {"Accept": "application/json", "User-Agent": "grid-alert-bot/1.0"}
+    headers = {"Accept": "application/json", "User-Agent": "grid-alert-bot/1.1"}
 
     for attempt in range(1, retries + 1):
         try:
@@ -86,13 +86,13 @@ SOL_LOWER = env_float("SOL_LOWER", 80.0)
 SOL_UPPER = env_float("SOL_UPPER", 88.0)
 SOL_NEAR_PCT = env_float("SOL_NEAR_PCT", 1.0)
 
-DOGE_LOWER = env_float("DOGE_LOWER", 0.094)
-DOGE_UPPER = env_float("DOGE_UPPER", 0.112)
-DOGE_NEAR_PCT = env_float("DOGE_NEAR_PCT", 1.0)
-
-# RSI thresholds
+# RSI thresholds (общие для всех пар)
 RSI_OB = env_float("RSI_OVERBOUGHT", 70.0)
 RSI_OS = env_float("RSI_OVERSOLD", 30.0)
+
+# Минимальная "зона допуска" для выхода за диапазон (чтобы не шумело на копейки)
+# Например 0.05 = 0.05%
+OUTSIDE_TOL_PCT = env_float("OUTSIDE_TOL_PCT", 0.0)
 
 
 # ========= CoinGecko =========
@@ -101,7 +101,11 @@ CG_BASE = "https://api.coingecko.com/api/v3"
 COINS: Dict[str, str] = {
     "BTC": "bitcoin",
     "SOL": "solana",
-    "DOGE": "dogecoin",
+}
+
+PAIR_CONFIG = {
+    "BTC": {"lower": BTC_LOWER, "upper": BTC_UPPER, "near_pct": BTC_NEAR_PCT},
+    "SOL": {"lower": SOL_LOWER, "upper": SOL_UPPER, "near_pct": SOL_NEAR_PCT},
 }
 
 
@@ -115,7 +119,7 @@ def cg_simple_price_usd(symbol: str) -> float:
     return float(data[coin_id]["usd"])
 
 
-def cg_daily_closes_usd(symbol: str, days: int = 200) -> List[float]:
+def cg_daily_closes_usd(symbol: str, days: int = 220) -> List[float]:
     """
     Возвращает список daily close (USD) из CoinGecko market_chart (берём последнюю цену дня).
     """
@@ -184,60 +188,16 @@ def weekly_closes_from_daily(daily_closes: Optional[List[float]]) -> Optional[Li
     """
     if not daily_closes or len(daily_closes) < 30:
         return None
+
     weekly: List[float] = []
-    # возьмём с конца назад по 7 дней, потом перевернём
+    # Берём с конца назад по 7 дней, потом перевернём
     for i in range(len(daily_closes) - 1, -1, -7):
         weekly.append(daily_closes[i])
     weekly.reverse()
     return weekly
 
 
-# ========= Grid checks =========
-def check_bounds(symbol: str, price: float, lower: float, upper: float, near_pct: float) -> List[str]:
-    """
-    Возвращает list[str] триггеров (может быть пусто).
-    near_pct = например 0.7 (то есть 0.7%)
-    """
-    triggers: List[str] = []
-
-    # outside range
-    if price < lower:
-        dist_abs = lower - price
-        dist_pct = (dist_abs / lower) * 100.0 if lower else 0.0
-        triggers.append(
-            f"{symbol}: OUTSIDE ↓ ниже LOWER. Price={price:.8g} | LOWER={lower} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
-        )
-        return triggers
-
-    if price > upper:
-        dist_abs = price - upper
-        dist_pct = (dist_abs / upper) * 100.0 if upper else 0.0
-        triggers.append(
-            f"{symbol}: OUTSIDE ↑ выше UPPER. Price={price:.8g} | UPPER={upper} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
-        )
-        return triggers
-
-    # near lower
-    near_lower_level = lower * (1.0 + near_pct / 100.0)
-    if price <= near_lower_level:
-        dist_abs = price - lower
-        dist_pct = (dist_abs / lower) * 100.0 if lower else 0.0
-        triggers.append(
-            f"{symbol}: NEAR LOWER. Price={price:.8g} | LOWER={lower} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
-        )
-
-    # near upper
-    near_upper_level = upper * (1.0 - near_pct / 100.0)
-    if price >= near_upper_level:
-        dist_abs = upper - price
-        dist_pct = (dist_abs / upper) * 100.0 if upper else 0.0
-        triggers.append(
-            f"{symbol}: NEAR UPPER. Price={price:.8g} | UPPER={upper} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
-        )
-
-    return triggers
-
-
+# ========= Signals / checks =========
 def rsi_status(rsi_value: Optional[float]) -> str:
     if rsi_value is None:
         return "RSI: n/a"
@@ -248,117 +208,228 @@ def rsi_status(rsi_value: Optional[float]) -> str:
     return f"RSI: neutral ({rsi_value:.1f})"
 
 
-def recommended_action_for_grid(
-    symbol: str,
-    price: float,
-    triggers: List[str],
-    daily_rsi: Optional[float],
-    weekly_rsi: Optional[float],
-) -> List[str]:
+def is_rsi_trigger(rsi_value: Optional[float]) -> bool:
+    if rsi_value is None:
+        return False
+    return (rsi_value > RSI_OB) or (rsi_value < RSI_OS)
+
+
+def check_bounds(symbol: str, price: float, lower: float, upper: float, near_pct: float) -> List[str]:
     """
-    Очень простые рекомендации (без ATR — чтобы не усложнять и не ломать).
-    Если хочешь ATR-правило ±1.5 ATR — можно добавить позже.
+    Возвращает list[str] триггеров (может быть пусто).
+    near_pct = например 0.7 (то есть 0.7%)
+    OUTSIDE_TOL_PCT позволяет игнорировать микровыходы за диапазон.
     """
-    _ = (symbol, price)  # пока не используются в логике, оставляем для будущего расширения
+    triggers: List[str] = []
+
+    # Tolerance thresholds (outside only)
+    lower_outside_level = lower * (1.0 - OUTSIDE_TOL_PCT / 100.0)
+    upper_outside_level = upper * (1.0 + OUTSIDE_TOL_PCT / 100.0)
+
+    # outside range (with tolerance)
+    if price < lower_outside_level:
+        dist_abs = lower - price
+        dist_pct = (dist_abs / lower) * 100.0 if lower else 0.0
+        triggers.append(
+            f"{symbol}: OUTSIDE ↓ ниже LOWER. Price={price:.8g} | LOWER={lower} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
+        )
+        return triggers
+
+    if price > upper_outside_level:
+        dist_abs = price - upper
+        dist_pct = (dist_abs / upper) * 100.0 if upper else 0.0
+        triggers.append(
+            f"{symbol}: OUTSIDE ↑ выше UPPER. Price={price:.8g} | UPPER={upper} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
+        )
+        return triggers
+
+    # near lower (внутри диапазона, близко к нижней границе)
+    near_lower_level = lower * (1.0 + near_pct / 100.0)
+    if price >= lower and price <= near_lower_level:
+        dist_abs = price - lower
+        dist_pct = (dist_abs / lower) * 100.0 if lower else 0.0
+        triggers.append(
+            f"{symbol}: NEAR LOWER. Price={price:.8g} | LOWER={lower} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
+        )
+
+    # near upper (внутри диапазона, близко к верхней границе)
+    near_upper_level = upper * (1.0 - near_pct / 100.0)
+    if price <= upper and price >= near_upper_level:
+        dist_abs = upper - price
+        dist_pct = (dist_abs / upper) * 100.0 if upper else 0.0
+        triggers.append(
+            f"{symbol}: NEAR UPPER. Price={price:.8g} | UPPER={upper} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
+        )
+
+    return triggers
+
+
+def pair_recommendation(symbol: str, pair_triggers: List[str], daily_rsi: Optional[float], weekly_rsi: Optional[float]) -> List[str]:
+    """
+    Рекомендации ТОЛЬКО для конкретной пары.
+    """
     lines: List[str] = []
 
-    if any("OUTSIDE" in t for t in triggers):
-        lines.append("Action: PAUSE grid + shift range toward price (price вышел за диапазон).")
-        lines.append("Tip: после стабилизации перенеси LOWER/UPPER ближе к текущей цене и заново включи.")
-        return lines
+    has_outside = any("OUTSIDE" in t for t in pair_triggers)
+    has_near = any(("NEAR LOWER" in t or "NEAR UPPER" in t) for t in pair_triggers)
 
-    if any("NEAR LOWER" in t for t in triggers) or any("NEAR UPPER" in t for t in triggers):
-        lines.append("Action: Consider PAUSE (если волатильность резко выросла) или WIDEN range.")
+    if has_outside:
+        lines.append(f"{symbol}: PAUSE grid + shift range toward current price (эта пара вышла за диапазон).")
+        lines.append(f"{symbol}: После стабилизации перенеси LOWER/UPPER ближе к текущей цене и включи заново.")
+    elif has_near:
+        lines.append(f"{symbol}: Consider PAUSE (если волатильность выросла) или WIDEN range.")
     else:
-        lines.append("Action: Leave as-is.")
+        lines.append(f"{symbol}: Leave as-is.")
 
-    # RSI hint (BTC only обычно)
-    if daily_rsi is not None and (daily_rsi > RSI_OB or daily_rsi < RSI_OS):
-        lines.append("RSI hint: возможен перегрев/перепроданность — лучше уменьшить агрессию или расширить диапазон.")
-    if weekly_rsi is not None and (weekly_rsi > RSI_OB or weekly_rsi < RSI_OS):
-        lines.append("Weekly RSI hint: более сильный сигнал — лучше PAUSE или серьёзно расширить диапазон.")
+    if is_rsi_trigger(daily_rsi):
+        lines.append(f"{symbol}: Daily RSI hint → возможен перегрев/перепроданность, уменьшить агрессию/расширить диапазон.")
+    if is_rsi_trigger(weekly_rsi):
+        lines.append(f"{symbol}: Weekly RSI hint → более сильный сигнал, лучше PAUSE или серьёзно расширить диапазон.")
 
     return lines
 
 
+def fmt_price(symbol: str, price: float) -> str:
+    if symbol == "BTC":
+        return f"${price:,.2f}"
+    if symbol == "SOL":
+        return f"${price:,.4f}"
+    return f"${price}"
+
+
 def main() -> int:
+    symbols = ["BTC", "SOL"]
+
     # 1) Prices
+    prices: Dict[str, float] = {}
     try:
-        btc_price = cg_simple_price_usd("BTC")
-        sol_price = cg_simple_price_usd("SOL")
-        doge_price = cg_simple_price_usd("DOGE")
+        for s in symbols:
+            prices[s] = cg_simple_price_usd(s)
     except Exception as e:
         print(f"Price fetch error: {e!r}")
         return 1
 
-    # 2) Grid triggers
-    triggers: List[str] = []
-    triggers += check_bounds("BTC", btc_price, BTC_LOWER, BTC_UPPER, BTC_NEAR_PCT)
-    triggers += check_bounds("SOL", sol_price, SOL_LOWER, SOL_UPPER, SOL_NEAR_PCT)
-    triggers += check_bounds("DOGE", doge_price, DOGE_LOWER, DOGE_UPPER, DOGE_NEAR_PCT)
+    # 2) Price triggers per pair
+    price_triggers_by_symbol: Dict[str, List[str]] = {}
+    for s in symbols:
+        cfg = PAIR_CONFIG[s]
+        price_triggers_by_symbol[s] = check_bounds(
+            s,
+            prices[s],
+            cfg["lower"],
+            cfg["upper"],
+            cfg["near_pct"],
+        )
 
-    # 3) BTC RSI(14) daily & weekly
-    daily_rsi: Optional[float] = None
-    weekly_rsi: Optional[float] = None
-    try:
-        btc_daily_closes = cg_daily_closes_usd("BTC", days=220)
-        daily_rsi = rsi_14(btc_daily_closes)
-        btc_weekly_closes = weekly_closes_from_daily(btc_daily_closes)
-        weekly_rsi = rsi_14(btc_weekly_closes) if btc_weekly_closes else None
-    except Exception as e:
-        print("RSI calc error:", repr(e))
+    # 3) RSI daily & weekly per pair (BTC + SOL)
+    rsi_data: Dict[str, Dict[str, Optional[float]]] = {}
+    for s in symbols:
+        daily_rsi: Optional[float] = None
+        weekly_rsi: Optional[float] = None
+        try:
+            daily_closes = cg_daily_closes_usd(s, days=220)
+            daily_rsi = rsi_14(daily_closes)
+            weekly_closes = weekly_closes_from_daily(daily_closes)
+            weekly_rsi = rsi_14(weekly_closes) if weekly_closes else None
+        except Exception as e:
+            print(f"RSI calc error for {s}: {e!r}")
 
-    rsi_triggers: List[str] = []
-    if daily_rsi is not None and (daily_rsi > RSI_OB or daily_rsi < RSI_OS):
-        rsi_triggers.append(f"BTC Daily {rsi_status(daily_rsi)}")
-    if weekly_rsi is not None and (weekly_rsi > RSI_OB or weekly_rsi < RSI_OS):
-        rsi_triggers.append(f"BTC Weekly {rsi_status(weekly_rsi)}")
+        rsi_data[s] = {
+            "daily": daily_rsi,
+            "weekly": weekly_rsi,
+        }
 
-    # 4) Compose message
+    # 4) Determine if alert is needed
+    any_price_trigger = any(len(price_triggers_by_symbol[s]) > 0 for s in symbols)
+    any_rsi_trigger = any(
+        is_rsi_trigger(rsi_data[s]["daily"]) or is_rsi_trigger(rsi_data[s]["weekly"])
+        for s in symbols
+    )
+
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    if triggers or rsi_triggers:
+    if any_price_trigger or any_rsi_trigger:
         lines: List[str] = []
         lines.append(f"🚨 GRID ALERTS ({now_utc})")
         lines.append("")
-        lines.append(f"BTC: ${btc_price:,.2f} | Range [{BTC_LOWER:,.0f} .. {BTC_UPPER:,.0f}] | Near={BTC_NEAR_PCT}%")
-        lines.append(f"SOL: ${sol_price:,.4f} | Range [{SOL_LOWER:g} .. {SOL_UPPER:g}] | Near={SOL_NEAR_PCT}%")
-        lines.append(f"DOGE: ${doge_price:,.6f} | Range [{DOGE_LOWER:g} .. {DOGE_UPPER:g}] | Near={DOGE_NEAR_PCT}%")
+
+        # Summary
+        for s in symbols:
+            cfg = PAIR_CONFIG[s]
+            p = prices[s]
+            lower = cfg["lower"]
+            upper = cfg["upper"]
+            near_pct = cfg["near_pct"]
+
+            if s == "BTC":
+                lines.append(f"{s}: {fmt_price(s, p)} | Range [{lower:,.0f} .. {upper:,.0f}] | Near={near_pct}%")
+            else:
+                lines.append(f"{s}: {fmt_price(s, p)} | Range [{lower:g} .. {upper:g}] | Near={near_pct}%")
         lines.append("")
 
-        if triggers:
-            lines.append("📌 Price triggers:")
-            for t in triggers:
-                lines.append(f"• {t}")
+        # Detailed blocks per pair
+        for idx, s in enumerate(symbols, start=1):
+            cfg = PAIR_CONFIG[s]
+            p = prices[s]
+            pair_price_triggers = price_triggers_by_symbol[s]
+            daily_rsi = rsi_data[s]["daily"]
+            weekly_rsi = rsi_data[s]["weekly"]
+
+            lines.append(f"==== {s} ====")
+            lines.append(f"Price: {fmt_price(s, p)} | Range [{cfg['lower']} .. {cfg['upper']}] | Near={cfg['near_pct']}%")
             lines.append("")
 
-        lines.append("📈 BTC RSI(14):")
-        lines.append(f"• Daily: {rsi_status(daily_rsi)}")
-        lines.append(f"• Weekly: {rsi_status(weekly_rsi)}")
+            # Price triggers (specific pair)
+            if pair_price_triggers:
+                lines.append("📌 Price triggers:")
+                for t in pair_price_triggers:
+                    lines.append(f"• {t}")
+            else:
+                lines.append("📌 Price triggers:")
+                lines.append("• none")
 
-        if rsi_triggers:
             lines.append("")
-            lines.append("📌 RSI triggers:")
-            for t in rsi_triggers:
-                lines.append(f"• {t}")
 
-        lines.append("")
-        lines.append("🧭 Recommendation:")
-        for line in recommended_action_for_grid("BTC", btc_price, triggers, daily_rsi, weekly_rsi):
-            lines.append(f"• {line}")
+            # RSI (specific pair)
+            lines.append(f"📈 {s} RSI(14):")
+            lines.append(f"• Daily: {rsi_status(daily_rsi)}")
+            lines.append(f"• Weekly: {rsi_status(weekly_rsi)}")
+
+            pair_rsi_triggers: List[str] = []
+            if is_rsi_trigger(daily_rsi):
+                pair_rsi_triggers.append(f"{s} Daily {rsi_status(daily_rsi)}")
+            if is_rsi_trigger(weekly_rsi):
+                pair_rsi_triggers.append(f"{s} Weekly {rsi_status(weekly_rsi)}")
+
+            if pair_rsi_triggers:
+                lines.append("")
+                lines.append("📌 RSI triggers:")
+                for t in pair_rsi_triggers:
+                    lines.append(f"• {t}")
+
+            lines.append("")
+            lines.append("🧭 Recommendation:")
+            for rec in pair_recommendation(s, pair_price_triggers, daily_rsi, weekly_rsi):
+                lines.append(f"• {rec}")
+
+            if idx < len(symbols):
+                lines.append("")
+                lines.append("------------------------------")
+                lines.append("")
 
         sent = tg_send("\n".join(lines))
         print("Alert sent." if sent else "Alert not sent (see logs).")
         return 0
 
-    # SAFE: do NOT send Telegram message (only log)
-    safe_line = (
-        f"SAFE  "
-        f"BTC ${btc_price:,.2f} | SOL ${sol_price:,.4f} | DOGE ${doge_price:,.6f} | "
-        f"BTC RSI Daily {('n/a' if daily_rsi is None else f'{daily_rsi:.1f}')} / "
-        f"Weekly {('n/a' if weekly_rsi is None else f'{weekly_rsi:.1f}')}"
-    )
-    print(safe_line)
+    # SAFE: no Telegram message, only log
+    safe_parts = [f"SAFE ({now_utc})"]
+    for s in symbols:
+        safe_parts.append(
+            f"{s} {fmt_price(s, prices[s])} | "
+            f"RSI D {('n/a' if rsi_data[s]['daily'] is None else f'{rsi_data[s]['daily']:.1f}')} / "
+            f"W {('n/a' if rsi_data[s]['weekly'] is None else f'{rsi_data[s]['weekly']:.1f}')}"
+        )
+    print(" | ".join(safe_parts))
     return 0
 
 
