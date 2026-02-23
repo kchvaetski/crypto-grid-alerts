@@ -1,35 +1,19 @@
 import os
 import math
+import time
 import requests
 from datetime import datetime, timezone
 
-# ====== USER SETTINGS (hardcoded for now) ======
-BTC_LOWER = 65800.0
-BTC_UPPER = 69600.0
-BTC_NEAR_PCT = 0.007  # 0.7%
 
-SOL_LOWER = 80.0
-SOL_UPPER = 88.0
-SOL_NEAR_PCT = 0.01   # 1.0%
+# ========= Telegram =========
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-DOGE_LOWER = 0.094
-DOGE_UPPER = 0.112
-DOGE_NEAR_PCT = 0.01  # 1.0%
-
-# RSI thresholds
-RSI_OB = 70
-RSI_OS = 30
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-BINANCE_BASE = "https://api.binance.com"
-
-
-# ---------- Telegram ----------
-def send_telegram(text: str) -> None:
+def tg_send(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in env vars (GitHub Secrets).")
+        # чтобы workflow не падал, просто печатаем в лог
+        print("Telegram env vars missing. Message would be:\n", text)
+        return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -37,264 +21,274 @@ def send_telegram(text: str) -> None:
         "text": text,
         "disable_web_page_preview": True,
     }
-    r = requests.post(url, json=payload, timeout=25)
+    r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
 
 
-# ---------- Market Data ----------
-def binance_price(symbol: str) -> float:
-    # symbol like BTCUSDT, SOLUSDT, DOGEUSDT
-    url = f"{BINANCE_BASE}/api/v3/ticker/price"
-    r = requests.get(url, params={"symbol": symbol}, timeout=25)
+# ========= Settings from ENV =========
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    return float(str(v).strip())
+
+BTC_LOWER = env_float("BTC_LOWER", 65800.0)
+BTC_UPPER = env_float("BTC_UPPER", 69600.0)
+BTC_NEAR_PCT = env_float("BTC_NEAR_PCT", 0.7)  # percent
+
+SOL_LOWER = env_float("SOL_LOWER", 80.0)
+SOL_UPPER = env_float("SOL_UPPER", 88.0)
+SOL_NEAR_PCT = env_float("SOL_NEAR_PCT", 1.0)
+
+DOGE_LOWER = env_float("DOGE_LOWER", 0.094)
+DOGE_UPPER = env_float("DOGE_UPPER", 0.112)
+DOGE_NEAR_PCT = env_float("DOGE_NEAR_PCT", 1.0)
+
+# RSI thresholds
+RSI_OB = env_float("RSI_OVERBOUGHT", 70.0)
+RSI_OS = env_float("RSI_OVERSOLD", 30.0)
+
+
+# ========= CoinGecko =========
+CG_BASE = "https://api.coingecko.com/api/v3"
+
+COINS = {
+    "BTC": "bitcoin",
+    "SOL": "solana",
+    "DOGE": "dogecoin",
+}
+
+def cg_simple_price_usd(symbol: str) -> float:
+    coin_id = COINS[symbol]
+    url = f"{CG_BASE}/simple/price"
+    params = {"ids": coin_id, "vs_currencies": "usd"}
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
-    return float(r.json()["price"])
+    data = r.json()
+    return float(data[coin_id]["usd"])
 
-
-def binance_klines(symbol: str, interval: str, limit: int = 200):
-    # returns list of klines; each is an array
-    url = f"{BINANCE_BASE}/api/v3/klines"
-    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=25)
+def cg_daily_closes_usd(symbol: str, days: int = 200):
+    """
+    Возвращает список daily close (USD) из CoinGecko market_chart (берём последний price дня).
+    """
+    coin_id = COINS[symbol]
+    url = f"{CG_BASE}/coins/{coin_id}/market_chart"
+    params = {"vs_currency": "usd", "days": str(days)}
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    prices = data.get("prices", [])
+    # prices = [[ms, price], ...] (обычно много точек/день)
+    # соберём по дате (UTC) и возьмём последнюю цену дня
+    by_day = {}
+    for ms, p in prices:
+        day = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date().isoformat()
+        by_day.setdefault(day, [])
+        by_day[day].append(float(p))
+    # упорядочим по дате
+    days_sorted = sorted(by_day.keys())
+    closes = [by_day[d][-1] for d in days_sorted if len(by_day[d]) > 0]
+    return closes
 
-
-def _wilder_rsi(closes, period: int = 14) -> float:
-    if len(closes) < period + 2:
-        return float("nan")
+def rsi_14(closes):
+    """
+    RSI(14) по классической формуле (Wilder).
+    """
+    period = 14
+    if closes is None or len(closes) < period + 1:
+        return None
 
     gains = []
     losses = []
-    for i in range(1, len(closes)):
+    for i in range(1, period + 1):
         diff = closes[i] - closes[i - 1]
         gains.append(max(diff, 0.0))
         losses.append(max(-diff, 0.0))
 
-    # initial average
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
     # Wilder smoothing
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    for i in range(period + 1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gain = max(diff, 0.0)
+        loss = max(-diff, 0.0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
 
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return float(rsi)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def weekly_closes_from_daily(daily_closes):
+    """
+    Берём weekly close как каждую 7-ю дневную цену (последний день недели).
+    Это приближение, но для сигналов RSI обычно достаточно.
+    """
+    if not daily_closes or len(daily_closes) < 30:
+        return None
+    weekly = []
+    # возьмём с конца назад по 7 дней, потом перевернём
+    for i in range(len(daily_closes) - 1, -1, -7):
+        weekly.append(daily_closes[i])
+    weekly.reverse()
+    return weekly
 
 
-def _wilder_atr(highs, lows, closes, period: int = 14) -> float:
-    if len(closes) < period + 2:
-        return float("nan")
+# ========= Grid checks =========
+def check_bounds(symbol: str, price: float, lower: float, upper: float, near_pct: float):
+    """
+    Возвращает list[str] триггеров (может быть пусто).
+    near_pct = например 0.7 (то есть 0.7%)
+    """
+    triggers = []
 
-    trs = []
-    for i in range(1, len(closes)):
-        high = highs[i]
-        low = lows[i]
-        prev_close = closes[i - 1]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
+    # outside range
+    if price < lower:
+        dist_abs = lower - price
+        dist_pct = (dist_abs / lower) * 100.0
+        triggers.append(
+            f"{symbol}: OUTSIDE ↓ ниже LOWER. Price={price:.8g} | LOWER={lower} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
+        )
+        return triggers
 
-    atr = sum(trs[:period]) / period
-    for i in range(period, len(trs)):
-        atr = (atr * (period - 1) + trs[i]) / period
-    return float(atr)
+    if price > upper:
+        dist_abs = price - upper
+        dist_pct = (dist_abs / upper) * 100.0
+        triggers.append(
+            f"{symbol}: OUTSIDE ↑ выше UPPER. Price={price:.8g} | UPPER={upper} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
+        )
+        return triggers
 
+    # near lower
+    near_lower_level = lower * (1.0 + near_pct / 100.0)
+    if price <= near_lower_level:
+        dist_abs = price - lower
+        dist_pct = (dist_abs / lower) * 100.0
+        triggers.append(
+            f"{symbol}: NEAR LOWER. Price={price:.8g} | LOWER={lower} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
+        )
 
-def btc_rsi_and_atr(interval: str):
-    # interval: "1d" or "1w"
-    kl = binance_klines("BTCUSDT", interval, limit=200)
-    closes = [float(x[4]) for x in kl]
-    highs = [float(x[2]) for x in kl]
-    lows = [float(x[3]) for x in kl]
-    rsi = _wilder_rsi(closes, 14)
-    atr = _wilder_atr(highs, lows, closes, 14)
-    return rsi, atr
+    # near upper
+    near_upper_level = upper * (1.0 - near_pct / 100.0)
+    if price >= near_upper_level:
+        dist_abs = upper - price
+        dist_pct = (dist_abs / upper) * 100.0
+        triggers.append(
+            f"{symbol}: NEAR UPPER. Price={price:.8g} | UPPER={upper} | Δ={dist_abs:.8g} ({dist_pct:.3f}%)"
+        )
 
-
-# ---------- Alert Logic ----------
-def near_boundary(price: float, lower: float, upper: float, near_pct: float):
-    near_low = price <= lower * (1 + near_pct)
-    near_up = price >= upper * (1 - near_pct)
-    outside = (price < lower) or (price > upper)
-    return near_low, near_up, outside
-
-
-def fmt_money(x: float) -> str:
-    if abs(x) >= 1000:
-        return f"{x:,.2f}"
-    return f"{x:.6f}".rstrip("0").rstrip(".")
-
-
-def rsi_state(rsi: float) -> str:
-    if math.isnan(rsi):
-        return "unknown"
-    if rsi > RSI_OB:
-        return "overbought"
-    if rsi < RSI_OS:
-        return "oversold"
-    return "neutral"
+    return triggers
 
 
-def recommend_action_btc(price: float, lower: float, upper: float, atr_d: float, triggers: list) -> str:
-    # Simple rule: if outside or near edges, suggest pause & shift range using ±1.5 ATR (daily)
-    if math.isnan(atr_d) or atr_d <= 0:
-        atr_d = 0.0
+def rsi_status(rsi_value: float):
+    if rsi_value is None:
+        return "RSI: n/a"
+    if rsi_value > RSI_OB:
+        return f"RSI: OVERBOUGHT ({rsi_value:.1f})"
+    if rsi_value < RSI_OS:
+        return f"RSI: OVERSOLD ({rsi_value:.1f})"
+    return f"RSI: neutral ({rsi_value:.1f})"
 
-    shift = 1.5 * atr_d if atr_d else 0.0
 
-    if "OUTSIDE_RANGE" in triggers:
-        if price > upper:
-            if shift:
-                return f"РЕКОМЕНДАЦИЯ: ПАУЗА бот. Цена выше диапазона. Пересоздать/сдвинуть диапазон вверх: новый LOWER≈{fmt_money(price - shift)} / UPPER≈{fmt_money(price + shift)} (±1.5 ATR)."
-            return "РЕКОМЕНДАЦИЯ: ПАУЗА бот. Цена выше диапазона. Пересоздай диапазон выше (нет ATR в данных)."
-        else:
-            if shift:
-                return f"РЕКОМЕНДАЦИЯ: ПАУЗА бот. Цена ниже диапазона. Пересоздать/сдвинуть диапазон вниз: новый LOWER≈{fmt_money(price - shift)} / UPPER≈{fmt_money(price + shift)} (±1.5 ATR)."
-            return "РЕКОМЕНДАЦИЯ: ПАУЗА бот. Цена ниже диапазона. Пересоздай диапазон ниже (нет ATR в данных)."
+def recommended_action_for_grid(symbol: str, price: float, triggers: list, daily_rsi: float | None, weekly_rsi: float | None):
+    """
+    Очень простые рекомендации (без ATR — чтобы не усложнять и не ломать).
+    Если хочешь ATR-правило ±1.5 ATR — скажи, добавлю.
+    """
+    lines = []
+    if any("OUTSIDE" in t for t in triggers):
+        lines.append("Action: PAUSE grid + shift range toward price (price вышел за диапазон).")
+        lines.append("Tip: после стабилизации перенеси LOWER/UPPER ближе к текущей цене и заново включи.")
+        return lines
 
-    if "NEAR_LOWER" in triggers or "NEAR_UPPER" in triggers:
-        if shift:
-            return f"РЕКОМЕНДАЦИЯ: Пока НЕ выключать сразу. Если цена пробьёт границу — ПАУЗА и сдвиг диапазона вокруг цены: LOWER≈{fmt_money(price - shift)} / UPPER≈{fmt_money(price + shift)} (±1.5 ATR)."
-        return "РЕКОМЕНДАЦИЯ: Пока оставить как есть. Если пробьём границу — ПАУЗА и пересоздать диапазон вокруг текущей цены."
+    if any("NEAR LOWER" in t for t in triggers) or any("NEAR UPPER" in t for t in triggers):
+        lines.append("Action: Consider PAUSE (если волатильность резко выросла) или WIDEN range.")
+    else:
+        lines.append("Action: Leave as-is.")
 
-    if "RSI_EXTREME" in triggers:
-        return "РЕКОМЕНДАЦИЯ: RSI экстремальный. Для мини-грида безопаснее уменьшить агрессию/расширить диапазон или временно поставить на паузу, если начнутся резкие выносы."
+    # RSI hint (BTC only обычно)
+    if daily_rsi is not None and (daily_rsi > RSI_OB or daily_rsi < RSI_OS):
+        lines.append("RSI hint: возможен перегрев/перепроданность — лучше уменьшить агрессию или расширить диапазон.")
+    if weekly_rsi is not None and (weekly_rsi > RSI_OB or weekly_rsi < RSI_OS):
+        lines.append("Weekly RSI hint: более сильный сигнал — лучше PAUSE или серьёзно расширить диапазон.")
 
-    return "РЕКОМЕНДАЦИЯ: Leave as-is."
+    return lines
 
 
 def main():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # 1) Prices
+    btc_price = cg_simple_price_usd("BTC")
+    sol_price = cg_simple_price_usd("SOL")
+    doge_price = cg_simple_price_usd("DOGE")
 
-    # --- Prices ---
-    btc = binance_price("BTCUSDT")
-    sol = binance_price("SOLUSDT")
-    doge = binance_price("DOGEUSDT")
-
-    # --- BTC RSI/ATR ---
-    rsi_d, atr_d = btc_rsi_and_atr("1d")
-    rsi_w, atr_w = btc_rsi_and_atr("1w")
-
-    # --- BTC boundary checks ---
-    btc_near_low, btc_near_up, btc_outside = near_boundary(btc, BTC_LOWER, BTC_UPPER, BTC_NEAR_PCT)
-
+    # 2) Grid triggers
     triggers = []
-    details = []
+    triggers += check_bounds("BTC", btc_price, BTC_LOWER, BTC_UPPER, BTC_NEAR_PCT)
+    triggers += check_bounds("SOL", sol_price, SOL_LOWER, SOL_UPPER, SOL_NEAR_PCT)
+    triggers += check_bounds("DOGE", doge_price, DOGE_LOWER, DOGE_UPPER, DOGE_NEAR_PCT)
 
-    if btc_outside:
-        triggers.append("OUTSIDE_RANGE")
-        if btc > BTC_UPPER:
-            dist_usd = btc - BTC_UPPER
-            dist_pct = (dist_usd / BTC_UPPER) * 100
-            details.append(f"BTC вне диапазона: ВЫШЕ upper {fmt_money(BTC_UPPER)} на {fmt_money(dist_usd)} USD ({dist_pct:.3f}%).")
-        else:
-            dist_usd = BTC_LOWER - btc
-            dist_pct = (dist_usd / BTC_LOWER) * 100
-            details.append(f"BTC вне диапазона: НИЖЕ lower {fmt_money(BTC_LOWER)} на {fmt_money(dist_usd)} USD ({dist_pct:.3f}%).")
-    else:
-        if btc_near_low:
-            triggers.append("NEAR_LOWER")
-            dist_usd = btc - BTC_LOWER
-            dist_pct = (dist_usd / BTC_LOWER) * 100
-            details.append(f"BTC близко к LOWER {fmt_money(BTC_LOWER)}: расстояние {fmt_money(dist_usd)} USD ({dist_pct:.3f}%).")
-        if btc_near_up:
-            triggers.append("NEAR_UPPER")
-            dist_usd = BTC_UPPER - btc
-            dist_pct = (dist_usd / BTC_UPPER) * 100
-            details.append(f"BTC близко к UPPER {fmt_money(BTC_UPPER)}: расстояние {fmt_money(dist_usd)} USD ({dist_pct:.3f}%).")
+    # 3) BTC RSI(14) daily & weekly
+    daily_rsi = None
+    weekly_rsi = None
+    try:
+        btc_daily_closes = cg_daily_closes_usd("BTC", days=220)
+        daily_rsi = rsi_14(btc_daily_closes)
+        btc_weekly_closes = weekly_closes_from_daily(btc_daily_closes)
+        weekly_rsi = rsi_14(btc_weekly_closes) if btc_weekly_closes else None
+    except Exception as e:
+        print("RSI calc error:", repr(e))
 
-    # --- RSI checks ---
-    rsi_flags = []
-    if not math.isnan(rsi_d) and (rsi_d > RSI_OB or rsi_d < RSI_OS):
-        rsi_flags.append(f"RSI(14) Daily={rsi_d:.2f} ({rsi_state(rsi_d)})")
-    if not math.isnan(rsi_w) and (rsi_w > RSI_OB or rsi_w < RSI_OS):
-        rsi_flags.append(f"RSI(14) Weekly={rsi_w:.2f} ({rsi_state(rsi_w)})")
+    rsi_triggers = []
+    if daily_rsi is not None and (daily_rsi > RSI_OB or daily_rsi < RSI_OS):
+        rsi_triggers.append(f"BTC Daily {rsi_status(daily_rsi)}")
+    if weekly_rsi is not None and (weekly_rsi > RSI_OB or weekly_rsi < RSI_OS):
+        rsi_triggers.append(f"BTC Weekly {rsi_status(weekly_rsi)}")
 
-    if rsi_flags:
-        triggers.append("RSI_EXTREME")
-        details.append("BTC RSI сигнал: " + " | ".join(rsi_flags))
+    # 4) Compose message
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # --- SOL boundary checks ---
-    sol_near_low, sol_near_up, sol_outside = near_boundary(sol, SOL_LOWER, SOL_UPPER, SOL_NEAR_PCT)
-    sol_msg = None
-    if sol_outside or sol_near_low or sol_near_up:
-        if sol_outside:
-            if sol > SOL_UPPER:
-                dist = sol - SOL_UPPER
-                pct = (dist / SOL_UPPER) * 100
-                sol_msg = f"SOL ALERT: вне диапазона ВЫШЕ upper {SOL_UPPER} на {dist:.4f} ({pct:.2f}%)."
-            else:
-                dist = SOL_LOWER - sol
-                pct = (dist / SOL_LOWER) * 100
-                sol_msg = f"SOL ALERT: вне диапазона НИЖЕ lower {SOL_LOWER} на {dist:.4f} ({pct:.2f}%)."
-        else:
-            if sol_near_low:
-                dist = sol - SOL_LOWER
-                pct = (dist / SOL_LOWER) * 100
-                sol_msg = f"SOL ALERT: близко к LOWER {SOL_LOWER}, расстояние {dist:.4f} ({pct:.2f}%)."
-            if sol_near_up:
-                dist = SOL_UPPER - sol
-                pct = (dist / SOL_UPPER) * 100
-                extra = f"SOL ALERT: близко к UPPER {SOL_UPPER}, расстояние {dist:.4f} ({pct:.2f}%)."
-                sol_msg = (sol_msg + " | " + extra) if sol_msg else extra
+    if triggers or rsi_triggers:
+        lines = []
+        lines.append(f"🚨 GRID ALERTS ({now_utc})")
+        lines.append("")
+        lines.append(f"BTC: ${btc_price:,.2f} | Range [{BTC_LOWER:,.0f} .. {BTC_UPPER:,.0f}] | Near={BTC_NEAR_PCT}%")
+        lines.append(f"SOL: ${sol_price:,.4f} | Range [{SOL_LOWER:g} .. {SOL_UPPER:g}] | Near={SOL_NEAR_PCT}%")
+        lines.append(f"DOGE: ${doge_price:,.6f} | Range [{DOGE_LOWER:g} .. {DOGE_UPPER:g}] | Near={DOGE_NEAR_PCT}%")
+        lines.append("")
 
-    # --- DOGE boundary checks ---
-    doge_near_low, doge_near_up, doge_outside = near_boundary(doge, DOGE_LOWER, DOGE_UPPER, DOGE_NEAR_PCT)
-    doge_msg = None
-    if doge_outside or doge_near_low or doge_near_up:
-        if doge_outside:
-            if doge > DOGE_UPPER:
-                dist = doge - DOGE_UPPER
-                pct = (dist / DOGE_UPPER) * 100
-                doge_msg = f"DOGE ALERT: вне диапазона ВЫШЕ upper {DOGE_UPPER} на {dist:.6f} ({pct:.2f}%)."
-            else:
-                dist = DOGE_LOWER - doge
-                pct = (dist / DOGE_LOWER) * 100
-                doge_msg = f"DOGE ALERT: вне диапазона НИЖЕ lower {DOGE_LOWER} на {dist:.6f} ({pct:.2f}%)."
-        else:
-            if doge_near_low:
-                dist = doge - DOGE_LOWER
-                pct = (dist / DOGE_LOWER) * 100
-                doge_msg = f"DOGE ALERT: близко к LOWER {DOGE_LOWER}, расстояние {dist:.6f} ({pct:.2f}%)."
-            if doge_near_up:
-                dist = DOGE_UPPER - doge
-                pct = (dist / DOGE_UPPER) * 100
-                extra = f"DOGE ALERT: близко к UPPER {DOGE_UPPER}, расстояние {dist:.6f} ({pct:.2f}%)."
-                doge_msg = (doge_msg + " | " + extra) if doge_msg else extra
-
-    # --- Build Telegram text ---
-    header = f"🕒 {now}\nBTC={fmt_money(btc)} | SOL={sol:.4f} | DOGE={doge:.6f}"
-    btc_rsi_line = f"BTC RSI(14): Daily={rsi_d:.2f}({rsi_state(rsi_d)}) | Weekly={rsi_w:.2f}({rsi_state(rsi_w)})"
-    btc_bounds_line = f"BTC mini-grid: LOWER={fmt_money(BTC_LOWER)} / UPPER={fmt_money(BTC_UPPER)} | near={BTC_NEAR_PCT*100:.1f}%"
-
-    any_alert = bool(triggers) or (sol_msg is not None) or (doge_msg is not None)
-
-    if any_alert:
-        lines = [header, btc_bounds_line, btc_rsi_line, ""]
-        if details:
-            lines.append("⚠️ BTC TRIGGERS:")
-            lines.extend([f"- {d}" for d in details])
-            lines.append("")
-            lines.append(recommend_action_btc(btc, BTC_LOWER, BTC_UPPER, atr_d, triggers))
+        if triggers:
+            lines.append("📌 Price triggers:")
+            for t in triggers:
+                lines.append(f"• {t}")
             lines.append("")
 
-        if sol_msg:
-            lines.append(sol_msg)
-        else:
-            lines.append("SOL: SAFE (не рядом с границами)")
+        lines.append("📈 BTC RSI(14):")
+        lines.append(f"• Daily: {rsi_status(daily_rsi)}")
+        lines.append(f"• Weekly: {rsi_status(weekly_rsi)}")
+        if rsi_triggers:
+            lines.append("")
+            lines.append("📌 RSI triggers:")
+            for t in rsi_triggers:
+                lines.append(f"• {t}")
 
-        if doge_msg:
-            lines.append(doge_msg)
-        else:
-            lines.append("DOGE: SAFE (не рядом с границами)")
+        lines.append("")
+        lines.append("🧭 Recommendation:")
+        for l in recommended_action_for_grid("BTC", btc_price, triggers, daily_rsi, weekly_rsi):
+            lines.append(f"• {l}")
 
-        send_telegram("\n".join(lines))
-    else:
-        # one-line status
-        send_telegram(f"✅ {now} SAFE | BTC={fmt_money(btc)} (внутри диапазона) | RSI D={rsi_state(rsi_d)}, W={rsi_state(rsi_w)} | SOL SAFE | DOGE SAFE")
+        tg_send("\n".join(lines))
+        print("Alert sent.")
+        return
+
+# SAFE: do NOT send Telegram message (only log)
+safe_line = (
+    f"SAFE ({now_utc}) "
+    f"BTC ${btc_price:,.2f} | SOL ${sol_price:,.4f} | DOGE ${doge_price:,.6f} | "
+    f"BTC RSI Daily {('n/a' if daily_rsi is None else f'{daily_rsi:.1f}')} / Weekly {('n/a' if weekly_rsi is None else f'{weekly_rsi:.1f}')}"
+)
+print(safe_line)
 
 
 if __name__ == "__main__":
